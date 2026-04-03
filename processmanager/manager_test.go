@@ -159,18 +159,18 @@ func TestFrameCacheCrossProcessPollution(t *testing.T) {
 					FileName: libpf.Intern("go-binary"),
 				}),
 				Start: 0,
-				End:   0xFFFFFFF,
+				End:   0x1FFFFFF,
 			}),
 		},
 		{
-			Vaddr: 0x7f0000000000,
+			Vaddr: 0x7f0000100000,
 			FrameMapping: libpf.NewFrameMapping(libpf.FrameMappingData{
 				File: libpf.NewFrameMappingFile(libpf.FrameMappingFileData{
 					FileID:   libpf.NewFileID(uint64(libcHostFileID), 0),
 					FileName: libpf.Intern("libc.so.6"),
 				}),
 				Start: 0,
-				End:   0xFFFFFFF,
+				End:   0x300000,
 			}),
 		},
 	}
@@ -178,25 +178,25 @@ func TestFrameCacheCrossProcessPollution(t *testing.T) {
 
 	catMappings := []Mapping{
 		{
-			Vaddr: 0x400000,
+			Vaddr: 0x401000,
 			FrameMapping: libpf.NewFrameMapping(libpf.FrameMappingData{
 				File: libpf.NewFrameMappingFile(libpf.FrameMappingFileData{
 					FileID:   libpf.NewFileID(uint64(catHostFileID), 0),
 					FileName: libpf.Intern("cat"),
 				}),
 				Start: 0,
-				End:   0xFFFFFFF,
+				End:   0x10000,
 			}),
 		},
 		{
-			Vaddr: 0x7f0000000000,
+			Vaddr: 0x7f0000200000,
 			FrameMapping: libpf.NewFrameMapping(libpf.FrameMappingData{
 				File: libpf.NewFrameMappingFile(libpf.FrameMappingFileData{
 					FileID:   libpf.NewFileID(uint64(libcHostFileID), 0),
 					FileName: libpf.Intern("libc.so.6"),
 				}),
 				Start: 0,
-				End:   0xFFFFFFF,
+				End:   0x300000,
 			}),
 		},
 	}
