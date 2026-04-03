@@ -3,6 +3,7 @@ package processmanager
 import (
 	"os"
 	"runtime"
+	"strings"
 	"testing"
 
 	lru "github.com/elastic/go-freelru"
@@ -20,36 +21,31 @@ import (
 	"go.opentelemetry.io/ebpf-profiler/util"
 )
 
-// TestGoInterpreterSymbolizesForeignFileID demonstrates the bug where the Go
-// interpreter incorrectly symbolizes a native frame from a different file
-// (e.g. libc) because it only checks the frame type (Native) but not the
-// file ID. When the file-relative address in the foreign file coincidentally
-// matches a Go function's pclntab entry, the frame gets wrong Go symbols.
+// TestGoInterpreterSymbolizesForeignFileID verifies that the Go interpreter
+// rejects native frames whose file ID does not match the Go binary.
 //
-// The frame cache then amplifies the problem: since native frames are cached
-// without PID in the key, a subsequent process (without any Go interpreter)
-// receives the incorrectly symbolized frame from cache.
+// A native frame from libc whose file-relative address coincidentally matches
+// a Go pclntab entry must not be symbolized as a Go frame.
 func TestGoInterpreterSymbolizesForeignFileID(t *testing.T) {
-	assert := assert.New(t)
 	require := require.New(t)
 
-	// Use the test binary itself as the Go binary. Its pclntab is real
-	// and contains all runtime functions at their actual file VA addresses.
 	exec, err := os.Executable()
 	require.NoError(err)
 
-	// Get the file VA of a known Go function (runtime.Caller) so we can
-	// construct a frame at that address but with a *different* file ID,
-	// simulating a libc frame whose file offset collides with a Go function.
+	// Get the file VA of a known Go function so we can construct a frame at
+	// that address but with a different file ID, simulating a libc frame
+	// whose file offset collides with a Go pclntab entry.
 	pc, _, _, ok := runtime.Caller(0)
 	require.True(ok, "failed to get PC")
+	expectedFuncName := runtime.FuncForPC(pc).Name()
 
 	// Set up the Go interpreter from the test binary.
 	goPID := libpf.PID(os.Getpid())
 	pid := process.New(goPID, goPID)
 	elfRef := pfelf.NewReference(exec, pid)
 
-	goFileID, err := host.FileIDFromBytes([]byte{0xAA, 0x55, 0xAA, 0x55, 0xAA, 0x55, 0xAA, 0x55})
+	goFileID, err := host.FileIDFromBytes(
+		[]byte{0xAA, 0x55, 0xAA, 0x55, 0xAA, 0x55, 0xAA, 0x55})
 	require.NoError(err)
 
 	loaderInfo := interpreter.NewLoaderInfo(goFileID, elfRef)
@@ -61,42 +57,38 @@ func TestGoInterpreterSymbolizesForeignFileID(t *testing.T) {
 	goInstance, err := goData.Attach(nil, goPID, 0x0, rm)
 	require.NoError(err)
 
-	// Construct a native frame at the same address as the Go function,
-	// but with a completely different file ID (representing libc).
-	libcFileID, err := host.FileIDFromBytes([]byte{0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE, 0xBA, 0xBE})
+	// Sanity check: the Go interpreter must symbolize a frame from its own
+	// binary (same address, same file ID).
+	goEF := libpf.NewEbpfFrame(libpf.NativeFrame, 0, 2, uint64(pc))
+	goEF[1] = uint64(goFileID)
+	var goFrames libpf.Frames
+	err = goInstance.Symbolize(goEF, &goFrames, libpf.FrameMapping{})
+	require.NoError(err, "Go interpreter should symbolize frames from its own binary")
+	require.Len(goFrames, 1)
+	goFrame := goFrames[0].Value()
+	require.True(strings.HasPrefix(goFrame.FunctionName.String(), expectedFuncName),
+		"sanity: expected %q, got %q", expectedFuncName, goFrame.FunctionName)
+
+	// Now construct a native frame at the same address but with a completely
+	// different file ID (representing libc). The Go interpreter should reject
+	// it because the file ID does not belong to the Go binary.
+	libcFileID, err := host.FileIDFromBytes(
+		[]byte{0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE, 0xBA, 0xBE})
 	require.NoError(err)
 
-	ef := libpf.NewEbpfFrame(libpf.NativeFrame, 0, 2, uint64(pc))
-	ef[1] = uint64(libcFileID) // Variable(0) = libc file ID, NOT the Go binary
+	libcEF := libpf.NewEbpfFrame(libpf.NativeFrame, 0, 2, uint64(pc))
+	libcEF[1] = uint64(libcFileID)
 
-	// Try to symbolize this "libc" frame through the Go interpreter.
-	var frames libpf.Frames
-	err = goInstance.Symbolize(ef, &frames, libpf.FrameMapping{})
+	var libcFrames libpf.Frames
+	err = goInstance.Symbolize(libcEF, &libcFrames, libpf.FrameMapping{})
 
-	// BUG: The Go interpreter succeeds, producing a Go symbol for a frame
-	// that belongs to a completely different file. It should have either
-	// returned ErrMismatchInterpreterType or checked the file ID first.
-	if err == nil {
-		// The test demonstrates the bug exists: a libc frame got Go symbols.
-		assert.NotEmpty(frames, "Go interpreter produced frames for a foreign file ID")
-
-		if len(frames) > 0 {
-			f := frames[0].Value()
-			t.Logf("BUG: Go interpreter claimed a frame with fileID=%x (not the Go binary's %x)",
-				libcFileID, goFileID)
-			t.Logf("  Produced: type=%v func=%q file=%q",
-				f.Type, f.FunctionName, f.SourceFile)
-			assert.Equal(libpf.GoFrame, f.Type,
-				"frame was rewritten to GoFrame despite belonging to a different file")
-		}
-	} else {
-		// If this branch is reached, the bug is fixed: the Go interpreter
-		// correctly rejected the frame because the file ID didn't match.
-		t.Log("Go interpreter correctly rejected the foreign frame")
-	}
+	assert.ErrorIs(t, err, interpreter.ErrMismatchInterpreterType,
+		"Go interpreter must reject native frames from a foreign file ID")
+	assert.Empty(t, libcFrames,
+		"Go interpreter must not produce frames for a foreign file ID")
 }
 
-// traceCapture is a mock TraceReporter that records the last reported trace.
+// traceCapture is a mock TraceReporter that records reported traces.
 type traceCapture struct {
 	traces []*libpf.Trace
 }
@@ -106,17 +98,15 @@ func (tc *traceCapture) ReportTraceEvent(trace *libpf.Trace, _ *samples.TraceEve
 	return nil
 }
 
-// TestFrameCacheCrossProcessPollution demonstrates that the frame cache
-// serves incorrectly symbolized frames to unrelated processes because
-// native frames use PID-agnostic cache keys.
+// TestFrameCacheCrossProcessPollution verifies that a native frame from libc
+// is not incorrectly symbolized as a Go frame and then served from the cache
+// to unrelated processes.
 //
 // The test sends two EbpfTraces through HandleTrace — one for a Go process,
 // one for a plain C process ("cat") — both containing an identical native
 // frame with libc's file ID at an address that collides with a Go pclntab
-// entry. The Go process's trace gets incorrectly symbolized by the Go
-// interpreter, and that result is cached and served to the cat process.
+// entry. Neither trace should contain a GoFrame.
 func TestFrameCacheCrossProcessPollution(t *testing.T) {
-	assert := assert.New(t)
 	require := require.New(t)
 
 	exec, err := os.Executable()
@@ -124,11 +114,11 @@ func TestFrameCacheCrossProcessPollution(t *testing.T) {
 
 	pc, _, _, ok := runtime.Caller(0)
 	require.True(ok)
+	goFuncName := runtime.FuncForPC(pc).Name()
 
 	goPID := libpf.PID(1000)
 	catPID := libpf.PID(2000)
 
-	// host.FileID values used in the eBPF frame data.
 	goHostFileID, err := host.FileIDFromBytes(
 		[]byte{0xAA, 0x55, 0xAA, 0x55, 0xAA, 0x55, 0xAA, 0x55})
 	require.NoError(err)
@@ -173,7 +163,7 @@ func TestFrameCacheCrossProcessPollution(t *testing.T) {
 			// catPID has NO interpreters — it's a plain C program.
 		},
 		pidToProcessInfo: map[libpf.PID]*processInfo{
-			goPID: {mappings: []Mapping{{FrameMapping: libcMapping}}},
+			goPID:  {mappings: []Mapping{{FrameMapping: libcMapping}}},
 			catPID: {mappings: []Mapping{{FrameMapping: libcMapping}}},
 		},
 		frameCache:    frameCache,
@@ -187,8 +177,7 @@ func TestFrameCacheCrossProcessPollution(t *testing.T) {
 	frameData := libpf.NewEbpfFrame(libpf.NativeFrame, 0, 2, uint64(pc))
 	frameData[1] = uint64(libcHostFileID)
 
-	// Step 1: HandleTrace for the Go process. The Go interpreter will
-	// incorrectly symbolize the libc frame because it doesn't check file ID.
+	// Step 1: HandleTrace for the Go process.
 	pm.HandleTrace(&libpf.EbpfTrace{
 		PID:       goPID,
 		TID:       goPID,
@@ -203,15 +192,14 @@ func TestFrameCacheCrossProcessPollution(t *testing.T) {
 	goFrame := goTrace.Frames[0].Value()
 	t.Logf("Go process frame: type=%v func=%q", goFrame.Type, goFrame.FunctionName)
 
-	// BUG: The frame got Go type and Go function name despite being from libc.
-	assert.Equal(libpf.GoFrame, goFrame.Type,
-		"confirming the bug: libc frame was rewritten to GoFrame")
-	assert.NotEmpty(goFrame.FunctionName.String(),
-		"confirming the bug: libc frame got a Go function name")
+	// The frame belongs to libc, not the Go binary. It must remain a native
+	// frame and must not carry a Go function name.
+	assert.Equal(t, libpf.NativeFrame, goFrame.Type,
+		"libc frame in Go process must stay NativeFrame, not GoFrame")
+	assert.False(t, strings.HasPrefix(goFrame.FunctionName.String(), goFuncName),
+		"libc frame must not get Go function name %q", goFuncName)
 
 	// Step 2: HandleTrace for the cat process with the exact same frame data.
-	// Cat has no Go interpreter, but the incorrectly symbolized frame is now
-	// in the cache with a PID-agnostic key (native frames don't set PIDSpecific).
 	pm.HandleTrace(&libpf.EbpfTrace{
 		PID:       catPID,
 		TID:       catPID,
@@ -224,19 +212,12 @@ func TestFrameCacheCrossProcessPollution(t *testing.T) {
 	require.NotEmpty(catTrace.Frames, "cat process trace should have frames")
 
 	catFrame := catTrace.Frames[0].Value()
-	t.Logf("Cat process frame (from cache): type=%v func=%q",
-		catFrame.Type, catFrame.FunctionName)
+	t.Logf("Cat process frame: type=%v func=%q", catFrame.Type, catFrame.FunctionName)
 
-	// BUG: cat inherited the Go-symbolized frame from the cache.
-	assert.Equal(libpf.GoFrame, catFrame.Type,
-		"confirming the bug: cat process inherited GoFrame from cache")
-	assert.NotEmpty(catFrame.FunctionName.String(),
-		"confirming the bug: cat process inherited Go function name from cache")
-
-	// Verify the cache was involved: the Go process should have been a miss
-	// and cat should have been a hit.
-	assert.Equal(uint64(1), pm.frameCacheMiss.Load(),
-		"Go process frame should be a cache miss")
-	assert.Equal(uint64(1), pm.frameCacheHit.Load(),
-		"cat process frame should be a cache hit")
+	// The cat process is a plain C program. Its libc frame must also be a
+	// plain native frame without any Go symbolization.
+	assert.Equal(t, libpf.NativeFrame, catFrame.Type,
+		"libc frame in cat process must be NativeFrame, not GoFrame")
+	assert.False(t, strings.HasPrefix(catFrame.FunctionName.String(), goFuncName),
+		"cat process must not inherit Go function name %q from cache", goFuncName)
 }
