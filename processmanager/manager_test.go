@@ -4,7 +4,6 @@ import (
 	"os"
 	"runtime"
 	"slices"
-	"strings"
 	"testing"
 
 	lru "github.com/elastic/go-freelru"
@@ -39,7 +38,6 @@ func TestFrameCacheCrossProcessPollution(t *testing.T) {
 
 	pc, _, _, ok := runtime.Caller(0)
 	require.True(ok)
-	goFuncName := runtime.FuncForPC(pc).Name()
 
 	goPID := libpf.PID(1000)
 	catPID := libpf.PID(2000)
@@ -143,8 +141,7 @@ func TestFrameCacheCrossProcessPollution(t *testing.T) {
 
 	assert.Equal(t, libpf.NativeFrame, goFrame.Type,
 		"libc frame in Go process must stay NativeFrame, not GoFrame")
-	assert.False(t, strings.HasPrefix(goFrame.FunctionName.String(), goFuncName),
-		"libc frame must not get Go function name %q", goFuncName)
+	assert.Equal(t, "", goFrame.FunctionName.String())
 
 	pm.HandleTrace(&libpf.EbpfTrace{
 		PID:       catPID,
@@ -162,6 +159,5 @@ func TestFrameCacheCrossProcessPollution(t *testing.T) {
 
 	assert.Equal(t, libpf.NativeFrame, catFrame.Type,
 		"libc frame in cat process must be NativeFrame, not GoFrame")
-	assert.False(t, strings.HasPrefix(catFrame.FunctionName.String(), goFuncName),
-		"cat process must not inherit Go function name %q from cache", goFuncName)
+	assert.Equal(t, "", catFrame.FunctionName.String())
 }
