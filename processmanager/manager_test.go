@@ -142,49 +142,63 @@ func TestFrameCacheCrossProcessPollution(t *testing.T) {
 	goInstance, err := goData.Attach(nil, realPID, 0x0, rm)
 	require.NoError(err)
 
-	// Build mappings for the Go binary, cat executable, and libc.
-	goExeMapping := libpf.NewFrameMapping(libpf.FrameMappingData{
-		File: libpf.NewFrameMappingFile(libpf.FrameMappingFileData{
-			FileID:   libpf.NewFileID(uint64(goHostFileID), 0),
-			FileName: libpf.Intern("go-binary"),
-		}),
-		Start: 0,
-		End:   0xFFFFFFF,
-	})
-	catExeMapping := libpf.NewFrameMapping(libpf.FrameMappingData{
-		File: libpf.NewFrameMappingFile(libpf.FrameMappingFileData{
-			FileID:   libpf.NewFileID(uint64(catHostFileID), 0),
-			FileName: libpf.Intern("cat"),
-		}),
-		Start: 0,
-		End:   0xFFFFFFF,
-	})
-	libcMapping := libpf.NewFrameMapping(libpf.FrameMappingData{
-		File: libpf.NewFrameMappingFile(libpf.FrameMappingFileData{
-			FileID:   libpf.NewFileID(uint64(libcHostFileID), 0),
-			FileName: libpf.Intern("libc.so.6"),
-		}),
-		Start: 0,
-		End:   0xFFFFFFF,
-	})
-
 	goODID := util.OnDiskFileIdentifier{DeviceID: 1, InodeNum: 1}
 
 	frameCache, err := lru.New[frameCacheKey, libpf.Frames](1024, hashFrameCacheKey)
 	require.NoError(err)
 	frameCache.SetLifetime(frameCacheLifetime)
 
-	// findMappingForTrace does a binary search, so mappings must be sorted
-	// the same way production code sorts them (by FileID then Start).
+	// Build per-process mappings with realistic Vaddr layout, then sort
+	// the same way production code does (by FileID then Vaddr).
 	goMappings := []Mapping{
-		{FrameMapping: goExeMapping},
-		{FrameMapping: libcMapping},
+		{
+			Vaddr: 0x400000,
+			FrameMapping: libpf.NewFrameMapping(libpf.FrameMappingData{
+				File: libpf.NewFrameMappingFile(libpf.FrameMappingFileData{
+					FileID:   libpf.NewFileID(uint64(goHostFileID), 0),
+					FileName: libpf.Intern("go-binary"),
+				}),
+				Start: 0,
+				End:   0xFFFFFFF,
+			}),
+		},
+		{
+			Vaddr: 0x7f0000000000,
+			FrameMapping: libpf.NewFrameMapping(libpf.FrameMappingData{
+				File: libpf.NewFrameMappingFile(libpf.FrameMappingFileData{
+					FileID:   libpf.NewFileID(uint64(libcHostFileID), 0),
+					FileName: libpf.Intern("libc.so.6"),
+				}),
+				Start: 0,
+				End:   0xFFFFFFF,
+			}),
+		},
 	}
 	slices.SortFunc(goMappings, compareMapping)
 
 	catMappings := []Mapping{
-		{FrameMapping: catExeMapping},
-		{FrameMapping: libcMapping},
+		{
+			Vaddr: 0x400000,
+			FrameMapping: libpf.NewFrameMapping(libpf.FrameMappingData{
+				File: libpf.NewFrameMappingFile(libpf.FrameMappingFileData{
+					FileID:   libpf.NewFileID(uint64(catHostFileID), 0),
+					FileName: libpf.Intern("cat"),
+				}),
+				Start: 0,
+				End:   0xFFFFFFF,
+			}),
+		},
+		{
+			Vaddr: 0x7f0000000000,
+			FrameMapping: libpf.NewFrameMapping(libpf.FrameMappingData{
+				File: libpf.NewFrameMappingFile(libpf.FrameMappingFileData{
+					FileID:   libpf.NewFileID(uint64(libcHostFileID), 0),
+					FileName: libpf.Intern("libc.so.6"),
+				}),
+				Start: 0,
+				End:   0xFFFFFFF,
+			}),
+		},
 	}
 	slices.SortFunc(catMappings, compareMapping)
 
