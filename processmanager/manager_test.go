@@ -3,6 +3,7 @@ package processmanager
 import (
 	"os"
 	"runtime"
+	"slices"
 	"strings"
 	"testing"
 
@@ -142,9 +143,6 @@ func TestFrameCacheCrossProcessPollution(t *testing.T) {
 	require.NoError(err)
 
 	// Build mappings for the Go binary, cat executable, and libc.
-	// findMappingForTrace does a binary search sorted by (host.FileID, Start),
-	// so the mappings slices must be in that order.
-	// goHostFileID (0xAA55...) < catHostFileID (0xCA7C...) < libcHostFileID (0xDEAD...).
 	goExeMapping := libpf.NewFrameMapping(libpf.FrameMappingData{
 		File: libpf.NewFrameMappingFile(libpf.FrameMappingFileData{
 			FileID:   libpf.NewFileID(uint64(goHostFileID), 0),
@@ -176,6 +174,20 @@ func TestFrameCacheCrossProcessPollution(t *testing.T) {
 	require.NoError(err)
 	frameCache.SetLifetime(frameCacheLifetime)
 
+	// findMappingForTrace does a binary search, so mappings must be sorted
+	// the same way production code sorts them (by FileID then Start).
+	goMappings := []Mapping{
+		{FrameMapping: goExeMapping},
+		{FrameMapping: libcMapping},
+	}
+	slices.SortFunc(goMappings, compareMapping)
+
+	catMappings := []Mapping{
+		{FrameMapping: catExeMapping},
+		{FrameMapping: libcMapping},
+	}
+	slices.SortFunc(catMappings, compareMapping)
+
 	capture := &traceCapture{}
 	pm := &ProcessManager{
 		interpreters: map[libpf.PID]map[util.OnDiskFileIdentifier]interpreter.Instance{
@@ -183,14 +195,8 @@ func TestFrameCacheCrossProcessPollution(t *testing.T) {
 			// catPID has NO interpreters — it's a plain C program.
 		},
 		pidToProcessInfo: map[libpf.PID]*processInfo{
-			goPID: {mappings: []Mapping{
-				{FrameMapping: goExeMapping},
-				{FrameMapping: libcMapping},
-			}},
-			catPID: {mappings: []Mapping{
-				{FrameMapping: catExeMapping},
-				{FrameMapping: libcMapping},
-			}},
+			goPID:  {mappings: goMappings},
+			catPID: {mappings: catMappings},
 		},
 		frameCache:    frameCache,
 		traceReporter: capture,
