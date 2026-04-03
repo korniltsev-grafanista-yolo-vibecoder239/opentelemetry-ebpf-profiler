@@ -108,7 +108,7 @@ func (g *goInstance) Symbolize(ef libpf.EbpfFrame, frames *libpf.Frames, mapping
 	if !ef.Type().IsInterpType(libpf.Native) {
 		return interpreter.ErrMismatchInterpreterType
 	}
-	if ef.Length() < 2 || host.FileID(ef.Variable(0)) != g.d.fileID {
+	if ef.Length() != 2 || host.FileID(ef.Variable(0)) != g.d.fileID {
 		return interpreter.ErrMismatchInterpreterType
 	}
 
