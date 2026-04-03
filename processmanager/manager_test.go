@@ -122,6 +122,9 @@ func TestFrameCacheCrossProcessPollution(t *testing.T) {
 	goHostFileID, err := host.FileIDFromBytes(
 		[]byte{0xAA, 0x55, 0xAA, 0x55, 0xAA, 0x55, 0xAA, 0x55})
 	require.NoError(err)
+	catHostFileID, err := host.FileIDFromBytes(
+		[]byte{0xCA, 0x7C, 0xA7, 0xCA, 0x7C, 0xA7, 0xCA, 0x7C})
+	require.NoError(err)
 	libcHostFileID, err := host.FileIDFromBytes(
 		[]byte{0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE, 0xBA, 0xBE})
 	require.NoError(err)
@@ -138,12 +141,29 @@ func TestFrameCacheCrossProcessPollution(t *testing.T) {
 	goInstance, err := goData.Attach(nil, realPID, 0x0, rm)
 	require.NoError(err)
 
-	// Build a libc mapping whose libpf.FileID has Hi() == libcHostFileID,
-	// so findMappingForTrace can match the frame's host.FileID to this mapping.
-	libcLibpfFileID := libpf.NewFileID(uint64(libcHostFileID), 0)
+	// Build mappings for the Go binary, cat executable, and libc.
+	// findMappingForTrace does a binary search sorted by (host.FileID, Start),
+	// so the mappings slices must be in that order.
+	// goHostFileID (0xAA55...) < catHostFileID (0xCA7C...) < libcHostFileID (0xDEAD...).
+	goExeMapping := libpf.NewFrameMapping(libpf.FrameMappingData{
+		File: libpf.NewFrameMappingFile(libpf.FrameMappingFileData{
+			FileID:   libpf.NewFileID(uint64(goHostFileID), 0),
+			FileName: libpf.Intern("go-binary"),
+		}),
+		Start: 0,
+		End:   0xFFFFFFF,
+	})
+	catExeMapping := libpf.NewFrameMapping(libpf.FrameMappingData{
+		File: libpf.NewFrameMappingFile(libpf.FrameMappingFileData{
+			FileID:   libpf.NewFileID(uint64(catHostFileID), 0),
+			FileName: libpf.Intern("cat"),
+		}),
+		Start: 0,
+		End:   0xFFFFFFF,
+	})
 	libcMapping := libpf.NewFrameMapping(libpf.FrameMappingData{
 		File: libpf.NewFrameMappingFile(libpf.FrameMappingFileData{
-			FileID:   libcLibpfFileID,
+			FileID:   libpf.NewFileID(uint64(libcHostFileID), 0),
 			FileName: libpf.Intern("libc.so.6"),
 		}),
 		Start: 0,
@@ -163,8 +183,14 @@ func TestFrameCacheCrossProcessPollution(t *testing.T) {
 			// catPID has NO interpreters — it's a plain C program.
 		},
 		pidToProcessInfo: map[libpf.PID]*processInfo{
-			goPID:  {mappings: []Mapping{{FrameMapping: libcMapping}}},
-			catPID: {mappings: []Mapping{{FrameMapping: libcMapping}}},
+			goPID: {mappings: []Mapping{
+				{FrameMapping: goExeMapping},
+				{FrameMapping: libcMapping},
+			}},
+			catPID: {mappings: []Mapping{
+				{FrameMapping: catExeMapping},
+				{FrameMapping: libcMapping},
+			}},
 		},
 		frameCache:    frameCache,
 		traceReporter: capture,
