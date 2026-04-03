@@ -22,7 +22,6 @@ import (
 	"go.opentelemetry.io/ebpf-profiler/util"
 )
 
-// traceCapture is a mock TraceReporter that records reported traces.
 type traceCapture struct {
 	traces []*libpf.Trace
 }
@@ -32,14 +31,6 @@ func (tc *traceCapture) ReportTraceEvent(trace *libpf.Trace, _ *samples.TraceEve
 	return nil
 }
 
-// TestFrameCacheCrossProcessPollution verifies that a native frame from libc
-// is not incorrectly symbolized as a Go frame and then served from the cache
-// to unrelated processes.
-//
-// The test sends two EbpfTraces through HandleTrace — one for a Go process,
-// one for a plain C process ("cat") — both containing an identical native
-// frame with libc's file ID at an address that collides with a Go pclntab
-// entry. Neither trace should contain a GoFrame.
 func TestFrameCacheCrossProcessPollution(t *testing.T) {
 	require := require.New(t)
 
@@ -63,7 +54,6 @@ func TestFrameCacheCrossProcessPollution(t *testing.T) {
 		[]byte{0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE, 0xBA, 0xBE})
 	require.NoError(err)
 
-	// Load the real Go interpreter from the test binary.
 	realPID := libpf.PID(os.Getpid())
 	pid := process.New(realPID, realPID)
 	elfRef := pfelf.NewReference(exec, pid)
@@ -81,7 +71,6 @@ func TestFrameCacheCrossProcessPollution(t *testing.T) {
 	require.NoError(err)
 	frameCache.SetLifetime(frameCacheLifetime)
 
-	// Build per-process mappings, sorted by (FileID, Vaddr).
 	goMappings := []Mapping{
 		{FrameMapping: libpf.NewFrameMapping(libpf.FrameMappingData{
 			File: libpf.NewFrameMappingFile(libpf.FrameMappingFileData{
@@ -126,7 +115,6 @@ func TestFrameCacheCrossProcessPollution(t *testing.T) {
 	pm := &ProcessManager{
 		interpreters: map[libpf.PID]map[util.OnDiskFileIdentifier]interpreter.Instance{
 			goPID: {goODID: goInstance},
-			// catPID has NO interpreters — it's a plain C program.
 		},
 		pidToProcessInfo: map[libpf.PID]*processInfo{
 			goPID:  {mappings: goMappings},
@@ -136,14 +124,9 @@ func TestFrameCacheCrossProcessPollution(t *testing.T) {
 		traceReporter: capture,
 	}
 
-	// Build the eBPF frame data: a single native frame at a Go function's
-	// file VA but carrying libc's file ID. This is what the BPF unwinder
-	// produces when sampling a libc function whose file offset happens to
-	// collide with a Go pclntab entry.
 	frameData := libpf.NewEbpfFrame(libpf.NativeFrame, 0, 2, uint64(pc))
 	frameData[1] = uint64(libcHostFileID)
 
-	// Step 1: HandleTrace for the Go process.
 	pm.HandleTrace(&libpf.EbpfTrace{
 		PID:       goPID,
 		TID:       goPID,
@@ -151,21 +134,18 @@ func TestFrameCacheCrossProcessPollution(t *testing.T) {
 		FrameData: frameData,
 	})
 
-	require.Len(capture.traces, 1, "expected one reported trace for the Go process")
+	require.Len(capture.traces, 1)
 	goTrace := capture.traces[0]
-	require.NotEmpty(goTrace.Frames, "Go process trace should have frames")
+	require.NotEmpty(goTrace.Frames)
 
 	goFrame := goTrace.Frames[0].Value()
 	t.Logf("Go process frame: type=%v func=%q", goFrame.Type, goFrame.FunctionName)
 
-	// The frame belongs to libc, not the Go binary. It must remain a native
-	// frame and must not carry a Go function name.
 	assert.Equal(t, libpf.NativeFrame, goFrame.Type,
 		"libc frame in Go process must stay NativeFrame, not GoFrame")
 	assert.False(t, strings.HasPrefix(goFrame.FunctionName.String(), goFuncName),
 		"libc frame must not get Go function name %q", goFuncName)
 
-	// Step 2: HandleTrace for the cat process with the exact same frame data.
 	pm.HandleTrace(&libpf.EbpfTrace{
 		PID:       catPID,
 		TID:       catPID,
@@ -173,15 +153,13 @@ func TestFrameCacheCrossProcessPollution(t *testing.T) {
 		FrameData: frameData,
 	})
 
-	require.Len(capture.traces, 2, "expected two reported traces total")
+	require.Len(capture.traces, 2)
 	catTrace := capture.traces[1]
-	require.NotEmpty(catTrace.Frames, "cat process trace should have frames")
+	require.NotEmpty(catTrace.Frames)
 
 	catFrame := catTrace.Frames[0].Value()
 	t.Logf("Cat process frame: type=%v func=%q", catFrame.Type, catFrame.FunctionName)
 
-	// The cat process is a plain C program. Its libc frame must also be a
-	// plain native frame without any Go symbolization.
 	assert.Equal(t, libpf.NativeFrame, catFrame.Type,
 		"libc frame in cat process must be NativeFrame, not GoFrame")
 	assert.False(t, strings.HasPrefix(catFrame.FunctionName.String(), goFuncName),
