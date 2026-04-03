@@ -16,6 +16,7 @@ import (
 	"go.opentelemetry.io/ebpf-profiler/libpf/pfelf"
 	"go.opentelemetry.io/ebpf-profiler/process"
 	"go.opentelemetry.io/ebpf-profiler/remotememory"
+	"go.opentelemetry.io/ebpf-profiler/reporter/samples"
 	"go.opentelemetry.io/ebpf-profiler/util"
 )
 
@@ -95,9 +96,25 @@ func TestGoInterpreterSymbolizesForeignFileID(t *testing.T) {
 	}
 }
 
+// traceCapture is a mock TraceReporter that records the last reported trace.
+type traceCapture struct {
+	traces []*libpf.Trace
+}
+
+func (tc *traceCapture) ReportTraceEvent(trace *libpf.Trace, _ *samples.TraceEventMeta) error {
+	tc.traces = append(tc.traces, trace)
+	return nil
+}
+
 // TestFrameCacheCrossProcessPollution demonstrates that the frame cache
 // serves incorrectly symbolized frames to unrelated processes because
 // native frames use PID-agnostic cache keys.
+//
+// The test sends two EbpfTraces through HandleTrace — one for a Go process,
+// one for a plain C process ("cat") — both containing an identical native
+// frame with libc's file ID at an address that collides with a Go pclntab
+// entry. The Go process's trace gets incorrectly symbolized by the Go
+// interpreter, and that result is cached and served to the cat process.
 func TestFrameCacheCrossProcessPollution(t *testing.T) {
 	assert := assert.New(t)
 	require := require.New(t)
@@ -111,17 +128,19 @@ func TestFrameCacheCrossProcessPollution(t *testing.T) {
 	goPID := libpf.PID(1000)
 	catPID := libpf.PID(2000)
 
-	goFileID, err := host.FileIDFromBytes([]byte{0xAA, 0x55, 0xAA, 0x55, 0xAA, 0x55, 0xAA, 0x55})
+	// host.FileID values used in the eBPF frame data.
+	goHostFileID, err := host.FileIDFromBytes(
+		[]byte{0xAA, 0x55, 0xAA, 0x55, 0xAA, 0x55, 0xAA, 0x55})
+	require.NoError(err)
+	libcHostFileID, err := host.FileIDFromBytes(
+		[]byte{0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE, 0xBA, 0xBE})
 	require.NoError(err)
 
-	libcFileID, err := host.FileIDFromBytes([]byte{0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE, 0xBA, 0xBE})
-	require.NoError(err)
-
-	// Load the Go interpreter from the test binary.
+	// Load the real Go interpreter from the test binary.
 	realPID := libpf.PID(os.Getpid())
 	pid := process.New(realPID, realPID)
 	elfRef := pfelf.NewReference(exec, pid)
-	loaderInfo := interpreter.NewLoaderInfo(goFileID, elfRef)
+	loaderInfo := interpreter.NewLoaderInfo(goHostFileID, elfRef)
 	rm := remotememory.NewProcessVirtualMemory(realPID)
 
 	goData, err := golang.Loader(nil, loaderInfo)
@@ -129,9 +148,12 @@ func TestFrameCacheCrossProcessPollution(t *testing.T) {
 	goInstance, err := goData.Attach(nil, realPID, 0x0, rm)
 	require.NoError(err)
 
-	// Build FrameMapping for libc — this is what findMappingForTrace would return.
+	// Build a libc mapping whose libpf.FileID has Hi() == libcHostFileID,
+	// so findMappingForTrace can match the frame's host.FileID to this mapping.
+	libcLibpfFileID := libpf.NewFileID(uint64(libcHostFileID), 0)
 	libcMapping := libpf.NewFrameMapping(libpf.FrameMappingData{
 		File: libpf.NewFrameMappingFile(libpf.FrameMappingFileData{
+			FileID:   libcLibpfFileID,
 			FileName: libpf.Intern("libc.so.6"),
 		}),
 		Start: 0,
@@ -144,73 +166,77 @@ func TestFrameCacheCrossProcessPollution(t *testing.T) {
 	require.NoError(err)
 	frameCache.SetLifetime(frameCacheLifetime)
 
+	capture := &traceCapture{}
 	pm := &ProcessManager{
 		interpreters: map[libpf.PID]map[util.OnDiskFileIdentifier]interpreter.Instance{
 			goPID: {goODID: goInstance},
-			// catPID has NO interpreters (plain C program)
+			// catPID has NO interpreters — it's a plain C program.
 		},
 		pidToProcessInfo: map[libpf.PID]*processInfo{
-			goPID: {
-				mappings: []Mapping{{
-					FrameMapping: libcMapping,
-				}},
-			},
-			catPID: {
-				mappings: []Mapping{{
-					FrameMapping: libcMapping,
-				}},
-			},
+			goPID: {mappings: []Mapping{{FrameMapping: libcMapping}}},
+			catPID: {mappings: []Mapping{{FrameMapping: libcMapping}}},
 		},
-		frameCache: frameCache,
+		frameCache:    frameCache,
+		traceReporter: capture,
 	}
 
-	// Construct a native frame at a Go function's address but with libc's file ID.
-	// This simulates a libc frame whose file offset collides with a Go pclntab entry.
-	ef := libpf.NewEbpfFrame(libpf.NativeFrame, 0, 2, uint64(pc))
-	ef[1] = uint64(libcFileID)
+	// Build the eBPF frame data: a single native frame at a Go function's
+	// file VA but carrying libc's file ID. This is what the BPF unwinder
+	// produces when sampling a libc function whose file offset happens to
+	// collide with a Go pclntab entry.
+	frameData := libpf.NewEbpfFrame(libpf.NativeFrame, 0, 2, uint64(pc))
+	frameData[1] = uint64(libcHostFileID)
 
-	// Step 1: Process the frame for the Go process. The Go interpreter will
-	// incorrectly symbolize it because it doesn't check the file ID.
-	var goFrames libpf.Frames
-	cached := pm.convertFrame(goPID, ef, &goFrames)
+	// Step 1: HandleTrace for the Go process. The Go interpreter will
+	// incorrectly symbolize the libc frame because it doesn't check file ID.
+	pm.HandleTrace(&libpf.EbpfTrace{
+		PID:       goPID,
+		TID:       goPID,
+		NumFrames: 1,
+		FrameData: frameData,
+	})
 
-	if !cached {
-		t.Log("convertFrame returned false (not cacheable) — bug may be fixed")
-		return
-	}
+	require.Len(capture.traces, 1, "expected one reported trace for the Go process")
+	goTrace := capture.traces[0]
+	require.NotEmpty(goTrace.Frames, "Go process trace should have frames")
 
-	// The Go interpreter claimed the frame. It should have been left as a
-	// plain native frame with the libc mapping.
-	require.NotEmpty(goFrames)
-	goFrame := goFrames[0].Value()
-
+	goFrame := goTrace.Frames[0].Value()
 	t.Logf("Go process frame: type=%v func=%q", goFrame.Type, goFrame.FunctionName)
 
 	// BUG: The frame got Go type and Go function name despite being from libc.
 	assert.Equal(libpf.GoFrame, goFrame.Type,
-		"confirming the bug: frame was rewritten to GoFrame")
+		"confirming the bug: libc frame was rewritten to GoFrame")
 	assert.NotEmpty(goFrame.FunctionName.String(),
-		"confirming the bug: frame got a Go function name")
+		"confirming the bug: libc frame got a Go function name")
 
-	// Step 2: Cache the frame as HandleTrace would (native frames have pid=0 in key).
-	key := frameCacheKey{}
-	// Native frames don't have PIDSpecific flag, so key.pid stays 0.
-	copy(key.data[:], ef)
-	pm.frameCache.Add(key, goFrames)
+	// Step 2: HandleTrace for the cat process with the exact same frame data.
+	// Cat has no Go interpreter, but the incorrectly symbolized frame is now
+	// in the cache with a PID-agnostic key (native frames don't set PIDSpecific).
+	pm.HandleTrace(&libpf.EbpfTrace{
+		PID:       catPID,
+		TID:       catPID,
+		NumFrames: 1,
+		FrameData: frameData,
+	})
 
-	// Step 3: The cat process looks up the same frame — cache hit.
-	cachedFrames, hit := pm.frameCache.GetAndRefresh(key, frameCacheLifetime)
+	require.Len(capture.traces, 2, "expected two reported traces total")
+	catTrace := capture.traces[1]
+	require.NotEmpty(catTrace.Frames, "cat process trace should have frames")
 
-	// BUG: cat gets the Go-symbolized frame from cache.
-	require.True(hit, "expected cache hit for cat process")
-	require.NotEmpty(cachedFrames)
+	catFrame := catTrace.Frames[0].Value()
+	t.Logf("Cat process frame (from cache): type=%v func=%q",
+		catFrame.Type, catFrame.FunctionName)
 
-	catFrame := cachedFrames[0].Value()
-	t.Logf("Cat process frame (from cache): type=%v func=%q", catFrame.Type, catFrame.FunctionName)
-
-	// A plain C program should never have GoFrame type or Go function names.
+	// BUG: cat inherited the Go-symbolized frame from the cache.
 	assert.Equal(libpf.GoFrame, catFrame.Type,
 		"confirming the bug: cat process inherited GoFrame from cache")
 	assert.NotEmpty(catFrame.FunctionName.String(),
 		"confirming the bug: cat process inherited Go function name from cache")
+
+	// Verify the cache was involved: the Go process should have been a miss
+	// and cat should have been a hit.
+	assert.Equal(uint64(1), pm.frameCacheMiss.Load(),
+		"Go process frame should be a cache miss")
+	assert.Equal(uint64(1), pm.frameCacheHit.Load(),
+		"cat process frame should be a cache hit")
 }
