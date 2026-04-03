@@ -122,14 +122,14 @@ func TestFrameCacheCrossProcessPollution(t *testing.T) {
 		traceReporter: capture,
 	}
 
-	frameData := libpf.NewEbpfFrame(libpf.NativeFrame, 0, 2, uint64(pc))
-	frameData[1] = uint64(libcHostFileID)
+	libcFrame := libpf.NewEbpfFrame(libpf.NativeFrame, 0, 2, uint64(pc))
+	libcFrame[1] = uint64(libcHostFileID)
 
 	pm.HandleTrace(&libpf.EbpfTrace{
 		PID:       goPID,
 		TID:       goPID,
 		NumFrames: 1,
-		FrameData: frameData,
+		FrameData: libcFrame,
 	})
 
 	require.Len(capture.traces, 1)
@@ -137,17 +137,14 @@ func TestFrameCacheCrossProcessPollution(t *testing.T) {
 	require.NotEmpty(goTrace.Frames)
 
 	goFrame := goTrace.Frames[0].Value()
-	t.Logf("Go process frame: type=%v func=%q", goFrame.Type, goFrame.FunctionName)
-
-	assert.Equal(t, libpf.NativeFrame, goFrame.Type,
-		"libc frame in Go process must stay NativeFrame, not GoFrame")
+	assert.Equal(t, libpf.NativeFrame, goFrame.Type)
 	assert.Equal(t, "", goFrame.FunctionName.String())
 
 	pm.HandleTrace(&libpf.EbpfTrace{
 		PID:       catPID,
 		TID:       catPID,
 		NumFrames: 1,
-		FrameData: frameData,
+		FrameData: libcFrame,
 	})
 
 	require.Len(capture.traces, 2)
@@ -155,9 +152,6 @@ func TestFrameCacheCrossProcessPollution(t *testing.T) {
 	require.NotEmpty(catTrace.Frames)
 
 	catFrame := catTrace.Frames[0].Value()
-	t.Logf("Cat process frame: type=%v func=%q", catFrame.Type, catFrame.FunctionName)
-
-	assert.Equal(t, libpf.NativeFrame, catFrame.Type,
-		"libc frame in cat process must be NativeFrame, not GoFrame")
+	assert.Equal(t, libpf.NativeFrame, catFrame.Type)
 	assert.Equal(t, "", catFrame.FunctionName.String())
 }
